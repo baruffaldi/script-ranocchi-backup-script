@@ -62,18 +62,6 @@ $localArchivePath = Join-Path $ScriptDir $archiveName
 $StagingDirName = 'BackupStaging'
 $StagingDir     = Join-Path $ScriptDir $StagingDirName
 
-# Logica di ripristino: se non trovo BackupStaging, cerco cartelle "Backup-xxxxxxxx-xxxx"
-# rimaste da un'esecuzione fallita (che aveva rinominato lo staging).
-if (-not (Test-Path $StagingDir)) {
-    $leftovers = Get-ChildItem -Path $ScriptDir -Directory | Where-Object { $_.Name -match '^Backup-\d{8}-\d{4}$' }
-    # Se ce ne sono, prendiamo la più recente (o una qualsiasi) e la rinominiamo
-    if ($leftovers) {
-        $leftover = $leftovers | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-        Write-Warning "Trovata cartella staging residua: '$($leftover.Name)'. Ripristino in '$StagingDirName'."
-        Rename-Item -Path $leftover.FullName -NewName $StagingDirName -Force
-    }
-}
-
 $transcriptPath  = Join-Path $env:TEMP ("backup-transcript-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
 $hadError = $false
 
@@ -194,32 +182,10 @@ try {
 			'/XD', $AmecoTmp
 		)
 
-        # Rinomina temporanea per lo ZIP
-        $tempStagingPath = Join-Path $ScriptDir $backupFolder
-
-        # Se per assurdo esistesse già una cartella con quel nome (conflitto?), la rimuoviamo?
-        # Non dovrebbe accadere col timestamp, ma per sicurezza:
-        if (Test-Path $tempStagingPath) {
-            Write-Warning "Cartella temporanea $tempStagingPath esistente? Rimozione forzata."
-            Remove-Item $tempStagingPath -Recurse -Force
-        }
-
-        Write-Header "RINOMINA E COMPRESSIONE"
-        Write-Output "Rinomino '$StagingDirName' in '$backupFolder'..."
-        Rename-Item -Path $StagingDir -NewName $backupFolder
-
-        try {
-            # Ora $StagingDir non esiste più con quel nome, esiste $tempStagingPath
-		Compress-ItemToZip -ItemPath $tempStagingPath -ZipPath $localArchivePath
-		Write-Output "Creato archivio locale: $localArchivePath"
-        }
-        finally {
-            # Ripristino nome
-            Write-Output "Ripristino nome '$StagingDirName'..."
-            if (Test-Path $tempStagingPath) {
-                Rename-Item -Path $tempStagingPath -NewName $StagingDirName
-            }
-        }
+        Write-Header "COMPRESSIONE"
+        # Comprimo direttamente la cartella di staging
+        Compress-ItemToZip -ItemPath $StagingDir -ZipPath $localArchivePath
+        Write-Output "Creato archivio locale: $localArchivePath"
 
         # SPOSTAMENTO ARCHIVIO
         if (Test-Path $localArchivePath) {
