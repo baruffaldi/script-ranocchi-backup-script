@@ -13,6 +13,7 @@
 # =======================
 $KeepLogs      = $true              # se true copia dentro la cartella LOGS il log
 $RetentionDays = 20                 # N giorni; se 0, non cancella nulla
+$LocalRetentionDays = 3             # N giorni per retention locale (Archives); default 3
 $BackupRoot    = '\\NAS4FENIX\BackupRanocchi\'
 $SrcDocs       = 'C:\RANOCCHI\GISTUDIO\gisbil\docs'
 $SrcAmeco      = 'C:\RANOCCHI\GISTUDIO\AMeCO'
@@ -56,23 +57,13 @@ $DestDir         = Join-Path $BackupRoot $backupFolder
 # Backup su archivio
 $archiveName    = "$backupFolder.zip"
 $archivePath    = Join-Path $BackupRoot $archiveName
-$localArchivePath = Join-Path $ScriptDir $archiveName
+# Local archive path (Archives subfolder)
+$ArchivesDir    = Join-Path $ScriptDir 'Archives'
+$localArchivePath = Join-Path $ArchivesDir $archiveName
 
 # Staging persistente (nella cartella dello script)
 $StagingDirName = 'BackupStaging'
 $StagingDir     = Join-Path $ScriptDir $StagingDirName
-
-# Logica di ripristino: se non trovo BackupStaging, cerco cartelle "Backup-xxxxxxxx-xxxx"
-# rimaste da un'esecuzione fallita (che aveva rinominato lo staging).
-if (-not (Test-Path $StagingDir)) {
-    $leftovers = Get-ChildItem -Path $ScriptDir -Directory | Where-Object { $_.Name -match '^Backup-\d{8}-\d{4}$' }
-    # Se ce ne sono, prendiamo la più recente (o una qualsiasi) e la rinominiamo
-    if ($leftovers) {
-        $leftover = $leftovers | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-        Write-Warning "Trovata cartella staging residua: '$($leftover.Name)'. Ripristino in '$StagingDirName'."
-        Rename-Item -Path $leftover.FullName -NewName $StagingDirName -Force
-    }
-}
 
 $transcriptPath  = Join-Path $env:TEMP ("backup-transcript-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
 $hadError = $false
@@ -163,7 +154,13 @@ try {
 		if (-not (Test-Path $StagingDir)) {
             New-Item -ItemType Directory -Path $StagingDir -Force | Out-Null
         }
+        # Assicuro che esista la cartella Archives
+        if (-not (Test-Path $ArchivesDir)) {
+            New-Item -ItemType Directory -Path $ArchivesDir -Force | Out-Null
+        }
+
 		Write-Output "Staging persistente: $StagingDir"
+        Write-Output "Cartella archivi locali: $ArchivesDir"
 	}
 
     Write-Header "ESECUZIONE BACKUP SQL (batch preventivo)"
@@ -194,40 +191,30 @@ try {
 			'/XD', $AmecoTmp
 		)
 
-        # Rinomina temporanea per lo ZIP
-        $tempStagingPath = Join-Path $ScriptDir $backupFolder
+        Write-Header "PULIZIA ARCHIVI LOCALI VECCHI"
+        if ($LocalRetentionDays -gt 0) {
+            $localCutoff = (Get-Date).AddDays(-$LocalRetentionDays)
+            Write-Output "Retention locale: $LocalRetentionDays giorni (elimino file < $($localCutoff.ToString('yyyy-MM-dd HH:mm')))"
 
-        # Se per assurdo esistesse già una cartella con quel nome (conflitto?), la rimuoviamo?
-        # Non dovrebbe accadere col timestamp, ma per sicurezza:
-        if (Test-Path $tempStagingPath) {
-            Write-Warning "Cartella temporanea $tempStagingPath esistente? Rimozione forzata."
-            Remove-Item $tempStagingPath -Recurse -Force
-        }
-
-        Write-Header "RINOMINA E COMPRESSIONE"
-        Write-Output "Rinomino '$StagingDirName' in '$backupFolder'..."
-        Rename-Item -Path $StagingDir -NewName $backupFolder
-
-        try {
-            # Ora $StagingDir non esiste più con quel nome, esiste $tempStagingPath
-		Compress-ItemToZip -ItemPath $tempStagingPath -ZipPath $localArchivePath
-		Write-Output "Creato archivio locale: $localArchivePath"
-        }
-        finally {
-            # Ripristino nome
-            Write-Output "Ripristino nome '$StagingDirName'..."
-            if (Test-Path $tempStagingPath) {
-                Rename-Item -Path $tempStagingPath -NewName $StagingDirName
+            $oldLocalZips = Get-ChildItem -Path $ArchivesDir -Filter 'Backup-*.zip' -File -ErrorAction SilentlyContinue |
+                            Where-Object { $_.LastWriteTime -lt $localCutoff }
+            foreach ($lz in $oldLocalZips) {
+                Write-Output "Elimino ZIP locale: $($lz.FullName)"
+                Remove-Item $lz.FullName -Force -ErrorAction Stop
             }
         }
 
-        # SPOSTAMENTO ARCHIVIO
+        Write-Header "COMPRESSIONE"
+        # Comprimo direttamente la cartella di staging
+        Compress-ItemToZip -ItemPath $StagingDir -ZipPath $localArchivePath
+        Write-Output "Creato archivio locale: $localArchivePath"
+
+        # COPIA ARCHIVIO SU RETE
         if (Test-Path $localArchivePath) {
-            Write-Header "SPOSTAMENTO ARCHIVIO"
-            Write-Output "Sposto '$localArchivePath' in '$archivePath'..."
-            # Move-Item -Force sovrascrive se destinazione esiste
-            Move-Item -Path $localArchivePath -Destination $archivePath -Force
-            Write-Output "Archivio spostato correttamente in destinazione."
+            Write-Header "COPIA ARCHIVIO SU RETE"
+            Write-Output "Copio '$localArchivePath' in '$archivePath'..."
+            Copy-Item -Path $localArchivePath -Destination $archivePath -Force
+            Write-Output "Archivio copiato correttamente in destinazione."
         }
 
         # Non cancello più lo staging alla fine
