@@ -207,10 +207,17 @@ try {
         Write-Output "Rinomino '$StagingDirName' in '$backupFolder'..."
         Rename-Item -Path $StagingDir -NewName $backupFolder
 
+        # Percorso locale temporaneo per lo ZIP (nella stessa cartella dello script)
+        $localArchivePath = Join-Path $ScriptDir $archiveName
+
         try {
             # Ora $StagingDir non esiste più con quel nome, esiste $tempStagingPath
-		Compress-ItemToZip -ItemPath $tempStagingPath -ZipPath $archivePath
-		Write-Output "Creato archivio: $archivePath"
+            Write-Output "Comprimo in locale: $localArchivePath"
+            Compress-ItemToZip -ItemPath $tempStagingPath -ZipPath $localArchivePath
+
+            Write-Output "Sposto archivio in destinazione: $archivePath"
+            Move-Item -Path $localArchivePath -Destination $archivePath -Force
+            Write-Output "Archivio spostato con successo."
         }
         finally {
             # Ripristino nome
@@ -218,6 +225,10 @@ try {
             if (Test-Path $tempStagingPath) {
                 Rename-Item -Path $tempStagingPath -NewName $StagingDirName
             }
+            # Pulizia di sicurezza: se il move fallisce, potremmo avere ancora il file locale?
+            # Se ha fallito il move, l'utente potrebbe volerlo recuperare da locale,
+            # quindi meglio non cancellarlo automaticamente qui, ma lasciare che se ne occupi la run successiva (overwrite)
+            # o l'intervento manuale.
         }
 
         # Non cancello più lo staging alla fine
