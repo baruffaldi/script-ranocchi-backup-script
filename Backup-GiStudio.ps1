@@ -56,6 +56,7 @@ $DestDir         = Join-Path $BackupRoot $backupFolder
 # Backup su archivio
 $archiveName    = "$backupFolder.zip"
 $archivePath    = Join-Path $BackupRoot $archiveName
+$localArchivePath = Join-Path $ScriptDir $archiveName
 
 # Staging persistente (nella cartella dello script)
 $StagingDirName = 'BackupStaging'
@@ -209,8 +210,8 @@ try {
 
         try {
             # Ora $StagingDir non esiste più con quel nome, esiste $tempStagingPath
-		Compress-ItemToZip -ItemPath $tempStagingPath -ZipPath $archivePath
-		Write-Output "Creato archivio: $archivePath"
+		Compress-ItemToZip -ItemPath $tempStagingPath -ZipPath $localArchivePath
+		Write-Output "Creato archivio locale: $localArchivePath"
         }
         finally {
             # Ripristino nome
@@ -218,6 +219,15 @@ try {
             if (Test-Path $tempStagingPath) {
                 Rename-Item -Path $tempStagingPath -NewName $StagingDirName
             }
+        }
+
+        # SPOSTAMENTO ARCHIVIO
+        if (Test-Path $localArchivePath) {
+            Write-Header "SPOSTAMENTO ARCHIVIO"
+            Write-Output "Sposto '$localArchivePath' in '$archivePath'..."
+            # Move-Item -Force sovrascrive se destinazione esiste
+            Move-Item -Path $localArchivePath -Destination $archivePath -Force
+            Write-Output "Archivio spostato correttamente in destinazione."
         }
 
         # Non cancello più lo staging alla fine
