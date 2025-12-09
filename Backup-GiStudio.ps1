@@ -1,4 +1,4 @@
-<# 
+<#
 	Author: Filippo Baruffaldi <filippo@baruffaldi.info>
     Backup-GiStudio.ps1
     - Esegue il batch SQL preventivo
@@ -39,10 +39,17 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
+# Determina cartella script (necessaria per Staging e Logs)
+$ScriptDir =
+    if ($PSScriptRoot) { $PSScriptRoot }
+    elseif ($PSCommandPath) { Split-Path -Parent $PSCommandPath }
+    elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path }
+    else { (Get-Location).Path }
+
 $startTime       = Get-Date
 $timestamp       = Get-Date -Format 'yyyyMMdd-HHmm'
 
-# Backup su cartella
+# Backup su cartella (nome base)
 $backupFolder    = "Backup-$timestamp"
 $DestDir         = Join-Path $BackupRoot $backupFolder
 
@@ -50,11 +57,21 @@ $DestDir         = Join-Path $BackupRoot $backupFolder
 $archiveName    = "$backupFolder.zip"
 $archivePath    = Join-Path $BackupRoot $archiveName
 
-# Staging locale (per includere una root "Backup-..." nello ZIP)
-$stageDir       = Join-Path $env:TEMP ("backup-staging-{0}" -f ([guid]::NewGuid().ToString('N')))
-$stageRoot      = Join-Path $stageDir  $backupFolder
-$destDocs       = Join-Path $stageRoot 'docs'
-$destAmeco      = Join-Path $stageRoot 'AMeCO'
+# Staging persistente (nella cartella dello script)
+$StagingDirName = 'BackupStaging'
+$StagingDir     = Join-Path $ScriptDir $StagingDirName
+
+# Logica di ripristino: se non trovo BackupStaging, cerco cartelle "Backup-xxxxxxxx-xxxx"
+# rimaste da un'esecuzione fallita (che aveva rinominato lo staging).
+if (-not (Test-Path $StagingDir)) {
+    $leftovers = Get-ChildItem -Path $ScriptDir -Directory | Where-Object { $_.Name -match '^Backup-\d{8}-\d{4}$' }
+    # Se ce ne sono, prendiamo la più recente (o una qualsiasi) e la rinominiamo
+    if ($leftovers) {
+        $leftover = $leftovers | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        Write-Warning "Trovata cartella staging residua: '$($leftover.Name)'. Ripristino in '$StagingDirName'."
+        Rename-Item -Path $leftover.FullName -NewName $StagingDirName -Force
+    }
+}
 
 $transcriptPath  = Join-Path $env:TEMP ("backup-transcript-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
 $hadError = $false
@@ -71,7 +88,8 @@ function Invoke-RoboCopy {
         [string[]] $ExtraArgs = @()
     )
     if (-not (Test-Path $Source)) { throw "Sorgente non trovata: $Source" }
-    if (-not (Test-Path $Destination)) { New-Item -ItemType Directory -Path $Destination | Out-Null }
+    # RoboCopy crea la destinazione se manca, ma meglio essere espliciti
+    if (-not (Test-Path $Destination)) { New-Item -ItemType Directory -Path $Destination -Force | Out-Null }
 
     Write-Output "Eseguo RoboCopy:"
     Write-Output "  FROM: $Source"
@@ -102,23 +120,31 @@ function Get-SevenZipPath {
     return $null
 }
 
-function Compress-FolderToZip {
+function Compress-ItemToZip {
     param(
-        [Parameter(Mandatory)] [string] $SourceFolder,   # es. $stageRoot (contiene "Backup-...")
+        [Parameter(Mandatory)] [string] $ItemPath,   # Cartella o file da zippare
         [Parameter(Mandatory)] [string] $ZipPath
     )
+    # Calcolo parent e nome foglia per eseguire il comando dalla directory padre
+    # Questo assicura che lo ZIP contenga la cartella radice (es. Backup-...) e non solo il contenuto.
+    $parentDir = Split-Path -Parent $ItemPath
+    $itemName  = Split-Path -Leaf $ItemPath
+
     $sevenZip = Get-SevenZipPath
     if ($sevenZip) {
         Write-Output "Comprimo con 7-Zip (massimo, -mx=9): $ZipPath"
         if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
-        $args = @('a','-tzip','-mx=9','-y', $ZipPath, '.\*')
-        $proc = Start-Process -FilePath $sevenZip -ArgumentList $args -WorkingDirectory $SourceFolder -NoNewWindow -Wait -PassThru
+
+        # Eseguo 7z dalla cartella padre, includendo $itemName
+        $args = @('a','-tzip','-mx=9','-y', $ZipPath, $itemName)
+        $proc = Start-Process -FilePath $sevenZip -ArgumentList $args -WorkingDirectory $parentDir -NoNewWindow -Wait -PassThru
         if ($proc.ExitCode -ne 0) { throw "7-Zip ha restituito codice $($proc.ExitCode)" }
     } else {
         Write-Output "7-Zip non trovato: uso Compress-Archive (CompressionLevel=Optimal)."
         if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
-        # Importante: passiamo la cartella root per includerla come directory nel .zip
-        Compress-Archive -Path $SourceFolder -DestinationPath $ZipPath -CompressionLevel Optimal -Force
+
+        # Compress-Archive preserva la struttura se si punta alla cartella
+        Compress-Archive -Path $ItemPath -DestinationPath $ZipPath -CompressionLevel Optimal -Force
     }
 }
 
@@ -130,9 +156,13 @@ try {
     Write-Header "VERIFICHE PRELIMINARI"
     if (-not (Test-Path $BackupRoot)) { throw "La radice destinazione non esiste: $BackupRoot" }
     Write-Output "Destinazione: $BackupRoot"
+
 	if ($CompressBck) {
-		New-Item -ItemType Directory -Path $stageRoot -Force | Out-Null
-		Write-Output "Staging: $stageRoot"
+        # Assicuro che esista la StagingDir (o creata da zero o ripristinata/esistente)
+		if (-not (Test-Path $StagingDir)) {
+            New-Item -ItemType Directory -Path $StagingDir -Force | Out-Null
+        }
+		Write-Output "Staging persistente: $StagingDir"
 	}
 
     Write-Header "ESECUZIONE BACKUP SQL (batch preventivo)"
@@ -148,28 +178,53 @@ try {
     }
 
 	if ($CompressBck) {
-		Write-Header "COPIA SU STAGING (docs)"
+        $destDocs  = Join-Path $StagingDir 'docs'
+        $destAmeco = Join-Path $StagingDir 'AMeCO'
+
+		Write-Header "SINCRONIZZAZIONE STAGING (docs)"
+        # Uso /MIR per mirror (copia nuovi, aggiorna modificati, elimina cancellati)
 		Invoke-RoboCopy -Source $SrcDocs -Destination $destDocs -ExtraArgs @(
-			'/E','/COPY:DAT','/R:1','/W:5','/NFL','/NDL','/NP'
+			'/MIR','/COPY:DAT','/R:1','/W:5','/NFL','/NDL','/NP'
 		)
 
-		Write-Header "COPIA SU STAGING (AMeCO, escluso tmp)"
+		Write-Header "SINCRONIZZAZIONE STAGING (AMeCO, escluso tmp)"
 		Invoke-RoboCopy -Source $SrcAmeco -Destination $destAmeco -ExtraArgs @(
-			'/E','/COPY:DAT','/R:1','/W:5','/NFL','/NDL','/NP',
+			'/MIR','/COPY:DAT','/R:1','/W:5','/NFL','/NDL','/NP',
 			'/XD', $AmecoTmp
 		)
 
-		Write-Header "COMPRESSIONE ZIP"
-		Compress-FolderToZip -SourceFolder $stageDir -ZipPath $archivePath
-		Write-Output "Creato: $archivePath"
+        # Rinomina temporanea per lo ZIP
+        $tempStagingPath = Join-Path $ScriptDir $backupFolder
 
-		Write-Header "PULIZIA STAGING"
-		if (Test-Path $stageDir) { Remove-Item $stageDir -Recurse -Force }
-		Write-Output "Staging rimosso."
+        # Se per assurdo esistesse già una cartella con quel nome (conflitto?), la rimuoviamo?
+        # Non dovrebbe accadere col timestamp, ma per sicurezza:
+        if (Test-Path $tempStagingPath) {
+            Write-Warning "Cartella temporanea $tempStagingPath esistente? Rimozione forzata."
+            Remove-Item $tempStagingPath -Recurse -Force
+        }
+
+        Write-Header "RINOMINA E COMPRESSIONE"
+        Write-Output "Rinomino '$StagingDirName' in '$backupFolder'..."
+        Rename-Item -Path $StagingDir -NewName $backupFolder
+
+        try {
+            # Ora $StagingDir non esiste più con quel nome, esiste $tempStagingPath
+		Compress-ItemToZip -ItemPath $tempStagingPath -ZipPath $archivePath
+		Write-Output "Creato archivio: $archivePath"
+        }
+        finally {
+            # Ripristino nome
+            Write-Output "Ripristino nome '$StagingDirName'..."
+            if (Test-Path $tempStagingPath) {
+                Rename-Item -Path $tempStagingPath -NewName $StagingDirName
+            }
+        }
+
+        # Non cancello più lo staging alla fine
 	} else {
 		Write-Output "Creazione cartella di backup: $DestDir"
 		New-Item -ItemType Directory -Path $DestDir -Force | Out-Null
-	
+
 		Write-Header "COPIA CARTELLA DOCS"
 		$destDocs = Join-Path $DestDir 'docs'
 		Invoke-RoboCopy -Source $SrcDocs -Destination $destDocs -ExtraArgs @(
@@ -192,6 +247,9 @@ try {
 
     Write-Header "PULIZIA BACKUP VECCHI"
     if ($RetentionDays -gt 0) {
+        $cutoff = (Get-Date).AddDays(-$RetentionDays)
+        Write-Output "Retention: $RetentionDays giorni (elimino file < $($cutoff.ToString('yyyy-MM-dd HH:mm')))"
+
 		# Archivi
         $oldZips = Get-ChildItem -Path $BackupRoot -Filter 'Backup-*.zip' -File -ErrorAction SilentlyContinue |
                    Where-Object { $_.LastWriteTime -lt $cutoff }
@@ -201,8 +259,6 @@ try {
         }
 
 		# Cartelle
-        $cutoff = (Get-Date).AddDays(-$RetentionDays)
-        Write-Output "Retention: $RetentionDays giorni (elimino cartelle più vecchie del $($cutoff.ToString('yyyy-MM-dd HH:mm')))"
         $old = Get-ChildItem -Path $BackupRoot -Directory -ErrorAction SilentlyContinue |
                Where-Object { $_.Name -like 'Backup-*' -and $_.LastWriteTime -lt $cutoff }
 
@@ -294,11 +350,7 @@ if ($SmtpServer -ne '') {
 # Copia del transcript nella radice dei backup
 if ($KeepLogs) {
 	if ($transcriptPath -and (Test-Path $transcriptPath)) {
-		$ScriptDir =
-			if ($PSScriptRoot) { $PSScriptRoot }                       # PS3+ quando esegui un .ps1
-			elseif ($PSCommandPath) { Split-Path -Parent $PSCommandPath }
-			elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path }
-			else { (Get-Location).Path }                               # fallback (interattivo)
+        # $ScriptDir è già calcolato all'inizio
 
 		# LOGS dentro la cartella dello script
 		$LogsRoot = Join-Path $ScriptDir 'LOGS'
@@ -307,7 +359,7 @@ if ($KeepLogs) {
 		if (-not (Test-Path $LogsRoot)) {
 			New-Item -ItemType Directory -Path $LogsRoot -Force | Out-Null
 		}
-		
+
 		$destTranscript = Join-Path $LogsRoot ("{0}-transcript.log" -f $backupFolder)
 		Copy-Item -Path $transcriptPath -Destination $destTranscript -Force
 		Write-Output "Transcript copiato in: $destTranscript"
