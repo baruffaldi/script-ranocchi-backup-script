@@ -12,7 +12,7 @@
 #   CONFIGURAZIONE
 # =======================
 $KeepLogs      = $true              # se true copia dentro la cartella LOGS il log
-$RetentionDays = 20                 # N giorni; se 0, non cancella nulla
+$RetentionDays = 32                 # N giorni; se 0, non cancella nulla
 $LocalRetentionDays = 3             # N giorni per retention locale (Archives); default 3
 $BackupRoot    = '\\NAS4FENIX\BackupRanocchi\'
 $SrcDocs       = 'C:\RANOCCHI\GISTUDIO\gisbil\docs'
@@ -65,7 +65,8 @@ $localArchivePath = Join-Path $ArchivesDir $archiveName
 $StagingDirName = 'BackupStaging'
 $StagingDir     = Join-Path $ScriptDir $StagingDirName
 
-$transcriptPath  = Join-Path $env:TEMP ("backup-transcript-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+$LogsRoot = Join-Path $ScriptDir 'LOGS'
+$transcriptPath  = Join-Path $LogsRoot ("backup-transcript-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
 $hadError = $false
 
 function Write-Header($text) {
@@ -144,6 +145,15 @@ try {
     Start-Transcript -Path $transcriptPath -Append | Out-Null
     Write-Header "ORARIO"
     Write-Output ("Inizio: " + $startTime.ToString('yyyy-MM-dd HH:mm:ss'))
+	
+	<#
+	$lockFile = Join-Path $StagingDir '.lock'
+	if (Test-Path $lockFile) {
+		Write-Error "Script già in esecuzione"
+		exit 1
+	}
+	New-Item $lockFile -ItemType File | Out-Null
+	#>
 
     Write-Header "VERIFICHE PRELIMINARI"
     if (-not (Test-Path $BackupRoot)) { throw "La radice destinazione non esiste: $BackupRoot" }
@@ -174,23 +184,23 @@ try {
     if ($exit -ne 0) {
         throw "backupSQL.bat terminato con codice $exit (errore)."
     }
+	
+	$destDocs  = Join-Path $StagingDir 'docs'
+	$destAmeco = Join-Path $StagingDir 'AMeCO'
+
+	Write-Header "SINCRONIZZAZIONE STAGING (docs)"
+	# Uso /MIR per mirror (copia nuovi, aggiorna modificati, elimina cancellati)
+	Invoke-RoboCopy -Source $SrcDocs -Destination $destDocs -ExtraArgs @(
+		'/MIR','/COPY:DAT','/R:1','/W:5','/NFL','/NDL','/NP'
+	)
+
+	Write-Header "SINCRONIZZAZIONE STAGING (AMeCO, escluso tmp)"
+	Invoke-RoboCopy -Source $SrcAmeco -Destination $destAmeco -ExtraArgs @(
+		'/MIR','/COPY:DAT','/R:1','/W:5','/NFL','/NDL','/NP',
+		'/XD', $AmecoTmp
+	)
 
 	if ($CompressBck) {
-        $destDocs  = Join-Path $StagingDir 'docs'
-        $destAmeco = Join-Path $StagingDir 'AMeCO'
-
-		Write-Header "SINCRONIZZAZIONE STAGING (docs)"
-        # Uso /MIR per mirror (copia nuovi, aggiorna modificati, elimina cancellati)
-		Invoke-RoboCopy -Source $SrcDocs -Destination $destDocs -ExtraArgs @(
-			'/MIR','/COPY:DAT','/R:1','/W:5','/NFL','/NDL','/NP'
-		)
-
-		Write-Header "SINCRONIZZAZIONE STAGING (AMeCO, escluso tmp)"
-		Invoke-RoboCopy -Source $SrcAmeco -Destination $destAmeco -ExtraArgs @(
-			'/MIR','/COPY:DAT','/R:1','/W:5','/NFL','/NDL','/NP',
-			'/XD', $AmecoTmp
-		)
-
         Write-Header "PULIZIA ARCHIVI LOCALI VECCHI"
         if ($LocalRetentionDays -gt 0) {
             $localCutoff = (Get-Date).AddDays(-$LocalRetentionDays)
@@ -200,7 +210,11 @@ try {
                             Where-Object { $_.LastWriteTime -lt $localCutoff }
             foreach ($lz in $oldLocalZips) {
                 Write-Output "Elimino ZIP locale: $($lz.FullName)"
-                Remove-Item $lz.FullName -Force -ErrorAction Stop
+				try {
+					Remove-Item $lz.FullName -Force -ErrorAction Stop
+				} catch {
+					Write-Output "ZIP $($z.FullName) NON ELIMINATO"
+				}
             }
         }
 
@@ -216,29 +230,16 @@ try {
             Copy-Item -Path $localArchivePath -Destination $archivePath -Force
             Write-Output "Archivio copiato correttamente in destinazione."
         }
-
-        # Non cancello più lo staging alla fine
 	} else {
-		Write-Output "Creazione cartella di backup: $DestDir"
+		Write-Header "CREAZIONE CARTELLA DI BACKUP FINALE"
 		New-Item -ItemType Directory -Path $DestDir -Force | Out-Null
 
-		Write-Header "COPIA CARTELLA DOCS"
-		$destDocs = Join-Path $DestDir 'docs'
-		Invoke-RoboCopy -Source $SrcDocs -Destination $destDocs -ExtraArgs @(
-			'/E',                  # include sottocartelle (anche vuote)
-			'/COPY:DAT',           # copia Data, Attributi, Timestamp
-			'/R:1','/W:5',         # 1 retry, 5s attesa
-			'/NFL','/NDL','/NP'    # meno rumore
-		)
-
-		Write-Header "COPIA CARTELLA AMeCO (escludendo tmp)"
-		$destAmeco = Join-Path $DestDir 'AMeCO'
-		Invoke-RoboCopy -Source $SrcAmeco -Destination $destAmeco -ExtraArgs @(
-			'/E',
+		Write-Header "COPIA STAGING → DESTINAZIONE FINALE"
+		Invoke-RoboCopy -Source $StagingDir -Destination $DestDir -ExtraArgs @(
+			'/MIR',
 			'/COPY:DAT',
 			'/R:1','/W:5',
-			'/NFL','/NDL','/NP',
-			'/XD', $AmecoTmp      # esclude la sottocartella tmp
+			'/NFL','/NDL','/NP'
 		)
 	}
 
@@ -252,7 +253,11 @@ try {
                    Where-Object { $_.LastWriteTime -lt $cutoff }
         foreach ($z in $oldZips) {
             Write-Output "Elimino ZIP: $($z.FullName)"
-            Remove-Item $z.FullName -Force -ErrorAction Stop
+			try {
+				Remove-Item $z.FullName -Force -ErrorAction Stop
+			} catch {
+				Write-Output "ZIP $($z.FullName) NON ELIMINATO"
+			}
         }
 
 		# Cartelle
@@ -262,7 +267,11 @@ try {
         if ($old) {
             foreach ($dir in $old) {
                 Write-Output "Elimino: $($dir.FullName)"
-                Remove-Item -Path $dir.FullName -Recurse -Force -ErrorAction Stop
+				try {
+					Remove-Item -Path $dir.FullName -Recurse -Force -ErrorAction Stop
+				} catch {
+					Write-Output "FOLDER $($dir.FullName) NON ELIMINATA"
+				}
             }
         } else {
             Write-Output "Nessuna cartella da eliminare."
@@ -294,6 +303,7 @@ catch {
 }
 finally {
     Stop-Transcript | Out-Null
+    <#Remove-Item $lockFile -Force -ErrorAction SilentlyContinue#>
 }
 
 # =======================
@@ -344,6 +354,7 @@ if ($SmtpServer -ne '') {
 	}
 }
 
+<#
 # Copia del transcript nella radice dei backup
 if ($KeepLogs) {
 	if ($transcriptPath -and (Test-Path $transcriptPath)) {
@@ -367,3 +378,4 @@ if ($KeepLogs) {
 
 # (Opzionale) Rimuovi il transcript temporaneo
 # Remove-Item -Path $transcriptPath -Force -ErrorAction SilentlyContinue
+#>
