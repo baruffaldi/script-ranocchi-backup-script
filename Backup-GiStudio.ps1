@@ -12,17 +12,18 @@
 #   CONFIGURAZIONE
 # =======================
 $KeepLogs      = $true              # se true copia dentro la cartella LOGS il log
-$RetentionDays = 32                 # N giorni; se 0, non cancella nulla
-$LocalRetentionDays = 3             # N giorni per retention locale (Archives); default 3
-$BackupRoot    = '\\NAS4FENIX\BackupRanocchi\'
+$RetentionDays = 0                  # N giorni; se 0, non cancella nulla
+$LocalRetentionDays = 0             # N giorni per retention locale (Archives); default 3
+$BackupRoot    = '\\NAS4FENIX\BackupRanocchiIncremental\'
 $SrcDocs       = 'C:\RANOCCHI\GISTUDIO\gisbil\docs'
 $SrcAmeco      = 'C:\RANOCCHI\GISTUDIO\AMeCO'
 $AmecoTmp      = 'C:\RANOCCHI\GISTUDIO\AMeCO\tmp'
 $PreBackupBat  = 'C:\RANOCCHI\GISTUDIO\gisbil\docs\backupSQL.bat'
 
 # --- COMPRESSION ---
-$CompressBck   = $true              # se true comprime il backup
-$Prefer7Zip    = $true              # se true e 7zip presente, usa 7zip (comprime di più)
+$CompressBck          = $true      # se true comprime il backup
+$Prefer7Zip           = $true      # se true e 7zip presente, usa 7zip (comprime di più)
+$DestFolderWithDate   = $true      # se true usa una cartella con la data nel nome
 
 # --- SMTP ---
 $SmtpServer = ''
@@ -52,7 +53,11 @@ $timestamp       = Get-Date -Format 'yyyyMMdd-HHmm'
 
 # Backup su cartella (nome base)
 $backupFolder    = "Backup-$timestamp"
-$DestDir         = Join-Path $BackupRoot $backupFolder
+if ($DestFolderWithDate) {
+	$DestDir         = Join-Path $BackupRoot $backupFolder
+} else {
+	$DestDir         = $BackupRoot
+}
 
 # Backup su archivio
 $archiveName    = "$backupFolder.zip"
@@ -203,7 +208,7 @@ try {
 	if ($CompressBck) {
         Write-Header "PULIZIA ARCHIVI LOCALI VECCHI"
         if ($LocalRetentionDays -gt 0) {
-            $localCutoff = (Get-Date).AddDays(-$LocalRetentionDays)
+            $localCutoff = (Get-Date).AddDays(-$LocalRetentionDays+1)
             Write-Output "Retention locale: $LocalRetentionDays giorni (elimino file < $($localCutoff.ToString('yyyy-MM-dd HH:mm')))"
 
             $oldLocalZips = Get-ChildItem -Path $ArchivesDir -Filter 'Backup-*.zip' -File -ErrorAction SilentlyContinue |
@@ -232,8 +237,10 @@ try {
         }
 	} else {
 		Write-Header "CREAZIONE CARTELLA DI BACKUP FINALE"
-		New-Item -ItemType Directory -Path $DestDir -Force | Out-Null
-
+		if ($DestFolderWithDate) {
+			New-Item -ItemType Directory -Path $DestDir -Force | Out-Null
+		}
+		
 		Write-Header "COPIA STAGING → DESTINAZIONE FINALE"
 		Invoke-RoboCopy -Source $StagingDir -Destination $DestDir -ExtraArgs @(
 			'/MIR',
