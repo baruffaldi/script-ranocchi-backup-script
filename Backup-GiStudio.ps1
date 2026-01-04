@@ -11,19 +11,23 @@
 # =======================
 #   CONFIGURAZIONE
 # =======================
-$KeepLogs      = $true              # se true copia dentro la cartella LOGS il log
-$RetentionDays = 0                  # N giorni; se 0, non cancella nulla
-$LocalRetentionDays = 0             # N giorni per retention locale (Archives); default 3
-$BackupRoot    = '\\NAS4FENIX\BackupRanocchiIncremental\'
-$SrcDocs       = 'C:\RANOCCHI\GISTUDIO\gisbil\docs'
-$SrcAmeco      = 'C:\RANOCCHI\GISTUDIO\AMeCO'
-$AmecoTmp      = 'C:\RANOCCHI\GISTUDIO\AMeCO\tmp'
-$PreBackupBat  = 'C:\RANOCCHI\GISTUDIO\gisbil\docs\backupSQL.bat'
+$Debug                = $false       # se true visualizza più informazioni
+$KeepLogs             = $true      # se true copia dentro la cartella LOGS il log
+$RetentionDays        = 10          # N giorni; se 0, non cancella nulla
+$LocalRetentionDays   = 3          # N giorni per retention locale (Archives); default 3
+$DestFolderWithDate   = $true      # se true usa una cartella con la data nel nome
+$BackupSQL            = $false       # se true effettua il backup SQL
+
+# --- PATHS ---
+$BackupRoot           = '\\NAS4FENIX\BackupRanocchiIncremental\'
+$SrcDocs              = 'C:\RANOCCHI\GISTUDIO\gisbil\docs'
+$SrcAmeco             = 'C:\RANOCCHI\GISTUDIO\AMeCO'
+$AmecoTmp             = 'C:\RANOCCHI\GISTUDIO\AMeCO\tmp'
+$PreBackupBat         = 'C:\RANOCCHI\GISTUDIO\gisbil\docs\backupSQL.bat'
 
 # --- COMPRESSION ---
 $CompressBck          = $true      # se true comprime il backup
 $Prefer7Zip           = $true      # se true e 7zip presente, usa 7zip (comprime di più)
-$DestFolderWithDate   = $true      # se true usa una cartella con la data nel nome
 
 # --- SMTP ---
 $SmtpServer = ''
@@ -48,8 +52,9 @@ $ScriptDir =
     elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path }
     else { (Get-Location).Path }
 
-$startTime       = Get-Date
-$timestamp       = Get-Date -Format 'yyyyMMdd-HHmm'
+$script:startTime    = Get-Date
+$script:lastTime     = $script:startTime
+$timestamp            = Get-Date -Format 'yyyyMMdd-HHmm'
 
 # Backup su cartella (nome base)
 $backupFolder    = "Backup-$timestamp"
@@ -71,8 +76,11 @@ $StagingDirName = 'BackupStaging'
 $StagingDir     = Join-Path $ScriptDir $StagingDirName
 
 $LogsRoot = Join-Path $ScriptDir 'LOGS'
-$transcriptPath  = Join-Path $LogsRoot ("backup-transcript-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+$logsDate = Get-Date -Format 'yyyyMMdd-HHmmss'
+$transcriptPath  = Join-Path $LogsRoot ("backup-transcript-{0}.log" -f ($logsDate))
+$debugPath  = Join-Path $LogsRoot ("backup-debug-{0}.log" -f ($logsDate))
 $hadError = $false
+
 
 function Write-Header($text) {
     Write-Output ""
@@ -85,9 +93,40 @@ function Invoke-RoboCopy {
         [Parameter(Mandatory)] [string] $Destination,
         [string[]] $ExtraArgs = @()
     )
+
     if (-not (Test-Path $Source)) { throw "Sorgente non trovata: $Source" }
-    # RoboCopy crea la destinazione se manca, ma meglio essere espliciti
     if (-not (Test-Path $Destination)) { New-Item -ItemType Directory -Path $Destination -Force | Out-Null }
+
+    # Normalizza in una List (mantiene ordine e non perde niente)
+    $argsList = New-Object System.Collections.Generic.List[string]
+    foreach ($a in $ExtraArgs) { if ($null -ne $a -and $a -ne '') { [void]$argsList.Add($a) } }
+
+    if ($Debug) {
+        if (-not $debugPath) { throw "Debug attivo ma `$debugPath non è definito" }
+
+        # Rimuove /NFL e /NDL (case-insensitive) mantenendo gli altri extraargs
+        for ($i = $argsList.Count - 1; $i -ge 0; $i--) {
+            if ($argsList[$i] -ieq '/NFL' -or $argsList[$i] -ieq '/NDL') {
+                $argsList.RemoveAt($i)
+            }
+        }
+
+        # Aggiunge solo se assente (case-insensitive)
+        $need = @('/V','/TS','/FP','/BYTES') #,'/TEE')
+        foreach ($n in $need) {
+            if (-not ($argsList | Where-Object { $_ -ieq $n })) {
+                [void]$argsList.Add($n)
+            }
+        }
+
+        # /LOG+:$debugPath solo se non esiste già /LOG: o /LOG+
+        if (-not ($argsList | Where-Object { $_ -match '^(?i)/LOG(\+|:)' })) {
+            [void]$argsList.Add("/LOG+:$debugPath")
+        }
+    }
+
+    # Torna a string[]
+    $ExtraArgs = $argsList.ToArray()
 
     Write-Output "Eseguo RoboCopy:"
     Write-Output "  FROM: $Source"
@@ -98,7 +137,6 @@ function Invoke-RoboCopy {
     $proc = Start-Process -FilePath 'robocopy.exe' -ArgumentList $args -NoNewWindow -Wait -PassThru
     $code = $proc.ExitCode
 
-    # Robocopy exit codes: 0 e 1 = successo; 2..7 = warning (accettabili); >=8 = errori.
     if ($code -ge 8) {
         throw "Robocopy ha restituito codice $code per '$Source' -> '$Destination'"
     } else {
@@ -146,10 +184,32 @@ function Compress-ItemToZip {
     }
 }
 
+function Calculate-Time {
+    param(
+        [bool] $Checkpoint = $false
+    )
+	
+    $thisTime  = Get-Date
+	
+	if ($CheckPoint) {
+		$when = "Orario"
+		$elapsed  = $thisTime - $lastTime
+	} else {
+		$when = "Fine"
+		$elapsed  = $thisTime - $script:startTime
+		Write-Output ("Inizio: "    + $script:startTime.ToString('yyyy-MM-dd HH:mm:ss'))
+	}
+	
+	Write-Output ($when + ": "    + $thisTime.ToString('yyyy-MM-dd HH:mm:ss'))
+    Write-Output ("Durata: "  + ('{0:hh\:mm\:ss}' -f $elapsed))
+	
+	$script:lastTime = $thisTime
+}
+
 try {
     Start-Transcript -Path $transcriptPath -Append | Out-Null
     Write-Header "ORARIO"
-    Write-Output ("Inizio: " + $startTime.ToString('yyyy-MM-dd HH:mm:ss'))
+    Write-Output ("Inizio: " + $script:startTime.ToString('yyyy-MM-dd HH:mm:ss'))
 	
 	<#
 	$lockFile = Join-Path $StagingDir '.lock'
@@ -176,19 +236,23 @@ try {
 
 		Write-Output "Staging persistente: $StagingDir"
         Write-Output "Cartella archivi locali: $ArchivesDir"
+		Calculate-Time $true
 	}
 
-    Write-Header "ESECUZIONE BACKUP SQL (batch preventivo)"
-    if (-not (Test-Path $PreBackupBat)) {
-        throw "File batch non trovato: $PreBackupBat"
-    }
-    Write-Output "Eseguo: $PreBackupBat"
-    $p = Start-Process -FilePath $PreBackupBat -NoNewWindow -Wait -PassThru
-    $exit = $p.ExitCode
-    Write-Output "backupSQL.bat ExitCode: $exit"
-    if ($exit -ne 0) {
-        throw "backupSQL.bat terminato con codice $exit (errore)."
-    }
+	if ($BackupSQL) {
+		Write-Header "ESECUZIONE BACKUP SQL (batch preventivo)"
+		if (-not (Test-Path $PreBackupBat)) {
+			throw "File batch non trovato: $PreBackupBat"
+		}
+		Write-Output "Eseguo: $PreBackupBat"
+		$p = Start-Process -FilePath $PreBackupBat -NoNewWindow -Wait -PassThru
+		$exit = $p.ExitCode
+		Write-Output "backupSQL.bat ExitCode: $exit"
+		if ($exit -ne 0) {
+			throw "backupSQL.bat terminato con codice $exit (errore)."
+		}
+		Calculate-Time $true
+	}
 	
 	$destDocs  = Join-Path $StagingDir 'docs'
 	$destAmeco = Join-Path $StagingDir 'AMeCO'
@@ -198,12 +262,14 @@ try {
 	Invoke-RoboCopy -Source $SrcDocs -Destination $destDocs -ExtraArgs @(
 		'/MIR','/COPY:DAT','/R:1','/W:5','/NFL','/NDL','/NP'
 	)
+	Calculate-Time $true
 
 	Write-Header "SINCRONIZZAZIONE STAGING (AMeCO, escluso tmp)"
 	Invoke-RoboCopy -Source $SrcAmeco -Destination $destAmeco -ExtraArgs @(
 		'/MIR','/COPY:DAT','/R:1','/W:5','/NFL','/NDL','/NP',
 		'/XD', $AmecoTmp
 	)
+	Calculate-Time $true
 
 	if ($CompressBck) {
         Write-Header "PULIZIA ARCHIVI LOCALI VECCHI"
@@ -221,12 +287,14 @@ try {
 					Write-Output "ZIP $($z.FullName) NON ELIMINATO"
 				}
             }
+			Calculate-Time $true
         }
 
         Write-Header "COMPRESSIONE"
         # Comprimo direttamente la cartella di staging
         Compress-ItemToZip -ItemPath $StagingDir -ZipPath $localArchivePath
         Write-Output "Creato archivio locale: $localArchivePath"
+		Calculate-Time $true
 
         # COPIA ARCHIVIO SU RETE
         if (Test-Path $localArchivePath) {
@@ -234,6 +302,7 @@ try {
             Write-Output "Copio '$localArchivePath' in '$archivePath'..."
             Copy-Item -Path $localArchivePath -Destination $archivePath -Force
             Write-Output "Archivio copiato correttamente in destinazione."
+			Calculate-Time $true
         }
 	} else {
 		Write-Header "CREAZIONE CARTELLA DI BACKUP FINALE"
@@ -248,6 +317,7 @@ try {
 			'/R:1','/W:5',
 			'/NFL','/NDL','/NP'
 		)
+		Calculate-Time $true
 	}
 
     Write-Header "PULIZIA BACKUP VECCHI"
@@ -266,6 +336,7 @@ try {
 				Write-Output "ZIP $($z.FullName) NON ELIMINATO"
 			}
         }
+		Calculate-Time $true
 
 		# Cartelle
         $old = Get-ChildItem -Path $BackupRoot -Directory -ErrorAction SilentlyContinue |
@@ -283,15 +354,13 @@ try {
         } else {
             Write-Output "Nessuna cartella da eliminare."
         }
+		Calculate-Time $true
     } else {
         Write-Output "Retention impostata a 0: salto la cancellazione dei vecchi backup."
     }
 
     Write-Header "ORARIO (FINE E DURATA)"
-    $endTime  = Get-Date
-    $elapsed  = $endTime - $startTime
-    Write-Output ("Fine: "    + $endTime.ToString('yyyy-MM-dd HH:mm:ss'))
-    Write-Output ("Durata: "  + ('{0:hh\:mm\:ss}' -f $elapsed))
+	Calculate-Time $false
 
 
     Write-Header "FINE OPERAZIONI"
